@@ -118,8 +118,48 @@ frictionless writes for them. The tables can be queried directly with SQL.
 
 In addition, two metadata tables are created and used for the lossless
 restore: `_frictionless_package` (the package descriptor) and
-`_frictionless_rows` (the exact cell values). Only the resources described
-there are read back; other tables in the database are ignored.
+`_frictionless_rows` (the row identity/order history and the exact cell
+values). Only the resources described there are read back; other tables in
+the database are ignored, and the metadata tables themselves are never
+exposed as resources.
+
+The business tables have exactly the published business columns: the row
+identity is maintained out-of-band, so direct SQL `SELECT`/`INSERT`/
+`UPDATE`/`DELETE` statements keep working, and existing primary/foreign key
+constraints stay in effect. To keep the history up to date, roundtrip
+publishing also installs three triggers per data table (named
+`_frictionless_<resource>_insert`, `..._update` and `..._delete`). They
+only write to the metadata table; applications do not need to use
+Frictionless or maintain any extra column to modify the data.
+
+### Row identity and order
+
+Rows written by the publish keep their published order. Rows inserted later
+by other tools are placed after all the earlier rows, in the order the
+inserts succeeded (for a multi-row `INSERT`, in the order of its rows).
+Positions are recorded by the triggers, so they are stable across
+transactions and process restarts:
+
+- `UPDATE` never changes the position of a row, even when it changes an
+  integer primary key (which is an alias of the SQLite rowid).
+- `DELETE` followed by an `INSERT` creates a new row, placed at the end of
+  the row order. Even if it reuses the deleted row's primary key or internal
+  rowid, it does not inherit the deleted row's exact published values.
+- Multiple `INSERT`s in one transaction are ordered by execution order.
+- A rolled back transaction leaves no rows, no positions and no restored
+  values behind.
+
+This works with no primary key, a single integer primary key, a text
+primary key and a composite primary key. If the data table uses `rowid`,
+`_rowid_` or `oid` as business column names, the reader automatically picks
+an unused alias instead of binding the business column; a table shadowing
+all three aliases falls back to its primary key. Publishing without any
+primary key in that case is rejected, because the rows cannot be identified.
+Two rows with identical content are still two rows with their own identities.
+
+Row order cannot be recovered from the final table contents alone for
+databases published by an older version of this implementation: see
+"Legacy databases" below.
 
 ### External changes
 
@@ -132,8 +172,14 @@ Other tools may modify the database after publishing. On read-back:
   become naive, other types are read as usual.
 - Cells changed with `UPDATE` are interpreted from their SQL value the same
   way; untouched cells are restored exactly. A cell whose SQL value equals
-  the published one counts as untouched.
+  the published one counts as untouched. This also applies to a published
+  row changed and then changed back to its published value, and to an
+  externally inserted row changed later: only rows written by the publish
+  own exact values, so a new row can never inherit the exact values of an
+  older row that happened to have the same SQL representation.
 - Rows removed with `DELETE` do not appear.
+- A row whose identity changed (e.g. an integer primary key update) keeps
+  its position and its exact values for untouched cells.
 - Externally written values that violate the schema do not raise while
   reading; they are reported by the regular validation.
 - If a table was dropped, or a column was added, dropped, renamed or
@@ -141,6 +187,25 @@ Other tools may modify the database after publishing. On read-back:
   resource (and the column when applicable).
 - If the roundtrip metadata tables were damaged, `Package(url)` raises a
   `FrictionlessException`.
+
+### Legacy databases
+
+These guarantees apply to databases published after this fix. A database
+published by an older version, when it has not been modified externally,
+still reads back exactly (descriptor and values): the reader recognizes the
+old metadata layout.
+
+However, old databases recorded only the rowid of each published row and
+have no operation history. For them the reader cannot know whether a row
+disappeared or was re-inserted, whether an integer primary key update
+moved a published row, or which later insert reused a freed rowid. It
+cannot be claimed that row identity and order can be reconstructed from the
+final table contents alone, and previously applied external modifications
+cannot be retroactively restored. Such databases should be republished in
+roundtrip mode if that history is needed.
+
+Roundtrip publishing and reading of tables without a roundtrip metadata
+(`roundtrip=False`) are unchanged by all of the above.
 
 ### Rejected publishes
 
@@ -152,7 +217,13 @@ creating any table (the database is left unchanged) when:
 - two resource names, or two field names of one resource, differ only by
   case,
 - the package contains a non-table resource,
-- the source data contains rows that do not pass schema validation.
+- the source data contains rows that do not pass schema validation,
+- a resource has no primary key but uses `rowid`, `_rowid_` and `oid` all
+  as field names (the rows cannot be identified),
+- a trigger with one of the reserved `_frictionless_<resource>_*` names
+  already exists in the database,
+- the reserved `_frictionless_rows_seq` index name already exists in the
+  database.
 
 ## Configuration
 

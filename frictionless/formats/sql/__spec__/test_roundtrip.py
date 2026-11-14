@@ -90,6 +90,49 @@ def execute_sql(url, *statements):
         conn.close()
 
 
+def execute_sql_in_transaction(url, *statements, commit=True):
+    """Execute statements (and optional rollback) in one explicit transaction"""
+    path = url.replace("sqlite:///", "")
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("BEGIN")
+        for statement in statements:
+            if statement == "ROLLBACK":
+                conn.execute("ROLLBACK")
+                return
+            conn.execute(statement)
+        if commit:
+            conn.execute("COMMIT")
+        else:
+            conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
+def read_ids_and_amounts(url):
+    rows = Package(url).resources[0].read_rows()
+    return [(row["id"], str(row["amount"])) for row in rows]
+
+
+def make_items(tmpdir, name, *, primary_key=True, amount="number"):
+    schema = {
+        "fields": [
+            {"name": "id", "type": "integer"},
+            {"name": "amount", "type": amount},
+        ]
+    }
+    if primary_key:
+        schema["primaryKey"] = ["id"]
+    url = make_url(tmpdir, name)
+    resource = TableResource(
+        data=[["id", "amount"], ["1", "10.10"], ["2", "20.20"]],
+        schema=Schema.from_descriptor(schema),
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    return url, resource
+
+
 # Roundtrip: all the field types
 
 
@@ -1042,3 +1085,828 @@ def test_sql_roundtrip_control_roundtrips_through_dialect(tmpdir):
         control=formats.SqlControl(table="t", roundtrip=True),
     )
     assert formats.SqlControl.from_dialect(resource.dialect).roundtrip is True
+
+
+# Roundtrip: row identity and order under external changes
+#
+# The tests below reproduce the scenarios in which the SQLite rowid alone is
+# not a stable row identity: an INTEGER PRIMARY KEY update moves the rowid,
+# a DELETE followed by an INSERT may reuse it, and externally inserted rows
+# must be ordered by their insertion order rather than by their rowid.
+
+
+def test_sql_roundtrip_external_insert_order_with_integer_primary_key(tmpdir):
+    url, _ = make_items(tmpdir, "insert_order.db")
+    execute_sql_in_transaction(
+        url,
+        "INSERT INTO items (id, amount) VALUES (20, 20)",
+        "INSERT INTO items (id, amount) VALUES (10, 10)",
+    )
+    # Published rows keep their order; new ones follow in insertion order,
+    # regardless of their (integer primary key) rowid / id value
+    assert read_ids_and_amounts(url) == [
+        (1, "10.10"),
+        (2, "20.20"),
+        (20, "20.0"),
+        (10, "10.0"),
+    ]
+
+
+def test_sql_roundtrip_external_primary_key_update_keeps_position_and_values(tmpdir):
+    url, _ = make_items(tmpdir, "pk_update.db")
+    execute_sql(url, "UPDATE items SET id = 100 WHERE id = 1")
+    # The updated row stays first and keeps its exact published value
+    assert read_ids_and_amounts(url) == [(100, "10.10"), (2, "20.20")]
+
+
+def test_sql_roundtrip_delete_then_insert_does_not_inherit_exact_values(tmpdir):
+    url, _ = make_items(tmpdir, "delete_insert.db", primary_key=False)
+    execute_sql(
+        url,
+        "DELETE FROM items WHERE id = 2",
+        "INSERT INTO items (id, amount) VALUES (3, 20.2)",
+    )
+    # The new row reuses the freed rowid but is a new row: it must be
+    # decoded from SQL (shortest decimal repr) at the end of the row order
+    assert read_ids_and_amounts(url) == [(1, "10.10"), (3, "20.2")]
+
+
+def test_sql_roundtrip_delete_then_insert_reusing_primary_key_is_a_new_row(tmpdir):
+    url, _ = make_items(tmpdir, "delete_insert_pk.db")
+    execute_sql(
+        url,
+        "DELETE FROM items WHERE id = 1",
+        "INSERT INTO items (id, amount) VALUES (1, 1.1)",
+    )
+    assert read_ids_and_amounts(url) == [(2, "20.20"), (1, "1.1")]
+
+
+def test_sql_roundtrip_update_primary_key_then_delete_and_reinsert(tmpdir):
+    url, _ = make_items(tmpdir, "pk_move_delete.db")
+    execute_sql(
+        url,
+        "UPDATE items SET id = 100 WHERE id = 1",
+        "DELETE FROM items WHERE id = 100",
+        "INSERT INTO items (id, amount) VALUES (1, 99.9)",
+    )
+    assert read_ids_and_amounts(url) == [(2, "20.20"), (1, "99.9")]
+
+
+def test_sql_roundtrip_new_row_updated_to_published_value_is_not_restored(tmpdir):
+    url, _ = make_items(tmpdir, "inherit.db", primary_key=False)
+    execute_sql(
+        url,
+        "DELETE FROM items WHERE id = 2",
+        "INSERT INTO items (id, amount) VALUES (3, 20.2)",
+        # Rewriting the new row to the SQL form of the deleted published
+        # value must not inherit the deleted row's exact value
+        "UPDATE items SET amount = 20.2 WHERE id = 3",
+    )
+    assert read_ids_and_amounts(url) == [(1, "10.10"), (3, "20.2")]
+
+
+def test_sql_roundtrip_update_to_same_value_then_back_restores_exact(tmpdir):
+    url, _ = make_items(tmpdir, "same_value.db")
+    execute_sql(
+        url,
+        "UPDATE items SET amount = 9.25 WHERE id = 1",
+        "UPDATE items SET amount = 10.1 WHERE id = 1",
+    )
+    # The row still belongs to the publish and its current SQL value equals
+    # the published one, so the exact value is restored
+    assert read_ids_and_amounts(url) == [(1, "10.10"), (2, "20.20")]
+
+
+def test_sql_roundtrip_shift_primary_keys_in_one_statement(tmpdir):
+    url, _ = make_items(tmpdir, "pk_shift.db")
+    execute_sql(url, "UPDATE items SET id = id + 100")
+    assert read_ids_and_amounts(url) == [(101, "10.10"), (102, "20.20")]
+
+
+def test_sql_roundtrip_multiple_published_rows_external_single_statement(tmpdir):
+    url = make_url(tmpdir, "multi.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "id", "type": "integer"},
+                {"name": "amount", "type": "number"},
+            ],
+            "primaryKey": ["id"],
+        }
+    )
+    resource = TableResource(
+        data=[["id", "amount"], ["0", "0.10"], ["-5", "5.50"], ["-1", "1.10"]],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(
+        url,
+        "INSERT INTO items (id, amount) VALUES (100, 100.1), (50, 50.5), (75, 75.75)",
+    )
+    assert read_ids_and_amounts(url) == [
+        (0, "0.10"),
+        (-5, "5.50"),
+        (-1, "1.10"),
+        (100, "100.1"),
+        (50, "50.5"),
+        (75, "75.75"),
+    ]
+
+
+def test_sql_roundtrip_integer_primary_key_named_rowid(tmpdir):
+    url = make_url(tmpdir, "pk_named_rowid.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "rowid", "type": "integer"},
+                {"name": "amount", "type": "number"},
+            ],
+            "primaryKey": ["rowid"],
+        }
+    )
+    resource = TableResource(
+        data=[["rowid", "amount"], ["1", "1.10"], ["2", "2.20"]],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(
+        url,
+        "UPDATE items SET rowid = 10 WHERE rowid = 2",
+        "INSERT INTO items (rowid, amount) VALUES (3, 3.30)",
+    )
+    rows = Package(url).resources[0].read_rows()
+    assert [(row["rowid"], str(row["amount"])) for row in rows] == [
+        (1, "1.10"),
+        (10, "2.20"),
+        (3, "3.3"),
+    ]
+
+
+def test_sql_roundtrip_text_primary_key(tmpdir):
+    url = make_url(tmpdir, "text_pk.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "id", "type": "string"},
+                {"name": "amount", "type": "number"},
+            ],
+            "primaryKey": ["id"],
+        }
+    )
+    resource = TableResource(
+        data=[["id", "amount"], ["b", "1.10"], ["a", "2.20"]],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(
+        url,
+        "UPDATE items SET id = 'c' WHERE id = 'b'",
+        "INSERT INTO items VALUES ('d', 3.3)",
+    )
+    assert read_ids_and_amounts(url) == [
+        ("c", "1.10"),
+        ("a", "2.20"),
+        ("d", "3.3"),
+    ]
+
+
+def test_sql_roundtrip_composite_primary_key(tmpdir):
+    url = make_url(tmpdir, "composite_pk.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "a", "type": "integer"},
+                {"name": "b", "type": "string"},
+                {"name": "amount", "type": "number"},
+            ],
+            "primaryKey": ["a", "b"],
+        }
+    )
+    resource = TableResource(
+        data=[
+            ["a", "b", "amount"],
+            ["1", "x", "1.10"],
+            ["1", "y", "2.20"],
+            ["2", "z", "3.30"],
+        ],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(
+        url,
+        "UPDATE items SET b = 'w' WHERE a = 1 AND b = 'x'",
+        "INSERT INTO items VALUES (0, 'q', 9.9)",
+    )
+    rows = Package(url).resources[0].read_rows()
+    assert [(row["a"], row["b"], str(row["amount"])) for row in rows] == [
+        (1, "w", "1.10"),
+        (1, "y", "2.20"),
+        (2, "z", "3.30"),
+        (0, "q", "9.9"),
+    ]
+
+
+def test_sql_roundtrip_no_primary_key_rowid_aliases_are_not_confused(tmpdir):
+    # Only "rowid" is shadowed: the identity uses "_rowid_"
+    url = make_url(tmpdir, "shadow_rowid.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "rowid", "type": "string"},
+                {"name": "amount", "type": "number"},
+            ]
+        }
+    )
+    resource = TableResource(
+        data=[["rowid", "amount"], ["a", "1.10"], ["b", "2.20"]],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(
+        url,
+        "INSERT INTO items VALUES ('c', 3.3)",
+        "UPDATE items SET amount = 9.9 WHERE rowid = 'a'",
+    )
+    rows = Package(url).resources[0].read_rows()
+    assert [(row["rowid"], str(row["amount"])) for row in rows] == [
+        ("a", "9.9"),
+        ("b", "2.20"),
+        ("c", "3.3"),
+    ]
+
+
+def test_sql_roundtrip_no_primary_key_two_rowid_aliases_are_not_confused(tmpdir):
+    # "rowid" and "_rowid_" are shadowed: the identity uses "oid"
+    url = make_url(tmpdir, "shadow_two.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "rowid", "type": "string"},
+                {"name": "_rowid_", "type": "string"},
+                {"name": "amount", "type": "number"},
+            ]
+        }
+    )
+    resource = TableResource(
+        data=[["rowid", "_rowid_", "amount"], ["a", "x", "1.10"], ["b", "y", "2.20"]],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(
+        url,
+        "INSERT INTO items VALUES ('c', 'z', 3.3)",
+        "UPDATE items SET amount = 9.9 WHERE rowid = 'a'",
+    )
+    rows = Package(url).resources[0].read_rows()
+    assert [(row["rowid"], row["_rowid_"], str(row["amount"])) for row in rows] == [
+        ("a", "x", "9.9"),
+        ("b", "y", "2.20"),
+        ("c", "z", "3.3"),
+    ]
+
+
+def test_sql_roundtrip_all_rowid_aliases_shadowed_with_primary_key(tmpdir):
+    # All aliases are shadowed: the identity falls back to the primary key
+    url = make_url(tmpdir, "shadow_all.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "rowid", "type": "string"},
+                {"name": "_rowid_", "type": "string"},
+                {"name": "oid", "type": "string"},
+                {"name": "amount", "type": "number"},
+            ],
+            "primaryKey": ["oid"],
+        }
+    )
+    resource = TableResource(
+        data=[
+            ["rowid", "_rowid_", "oid", "amount"],
+            ["a", "x", "k1", "1.10"],
+            ["b", "y", "k2", "2.20"],
+        ],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(
+        url,
+        "UPDATE items SET amount = 9.55 WHERE oid = 'k1'",
+        "UPDATE items SET oid = 'k9' WHERE oid = 'k2'",
+        "INSERT INTO items VALUES ('c', 'z', 'k3', 3.3)",
+    )
+    rows = Package(url).resources[0].read_rows()
+    assert [(row["oid"], str(row["amount"])) for row in rows] == [
+        ("k1", "9.55"),
+        ("k9", "2.20"),
+        ("k3", "3.3"),
+    ]
+
+
+def test_sql_roundtrip_all_rowid_aliases_shadowed_without_primary_key_is_rejected(
+    tmpdir,
+):
+    url = make_url(tmpdir, "shadow_rejected.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "rowid", "type": "string"},
+                {"name": "_rowid_", "type": "string"},
+                {"name": "oid", "type": "string"},
+                {"name": "amount", "type": "number"},
+            ]
+        }
+    )
+    resource = TableResource(
+        data=[["rowid", "_rowid_", "oid", "amount"], ["a", "x", "c", "1.10"]],
+        schema=schema,
+        name="items",
+    )
+    with pytest.raises(FrictionlessException) as excinfo:
+        Package(resources=[resource]).publish(
+            url, control=formats.SqlControl(roundtrip=True)
+        )
+    assert "rowid" in str(excinfo.value)
+    assert read_sql(url, "SELECT name FROM sqlite_master WHERE type='table'") == []
+
+
+def test_sql_roundtrip_transaction_rollback_leaves_no_trace(tmpdir):
+    url, _ = make_items(tmpdir, "rollback.db")
+    execute_sql_in_transaction(
+        url,
+        "INSERT INTO items (id, amount) VALUES (30, 30.3)",
+        "UPDATE items SET id = 100 WHERE id = 1",
+        "DELETE FROM items WHERE id = 2",
+        "ROLLBACK",
+    )
+    assert read_ids_and_amounts(url) == [(1, "10.10"), (2, "20.20")]
+
+
+def test_sql_roundtrip_transaction_commit_is_consistent(tmpdir):
+    url, _ = make_items(tmpdir, "commit.db")
+    execute_sql_in_transaction(
+        url,
+        "INSERT INTO items (id, amount) VALUES (30, 30.3)",
+        "INSERT INTO items (id, amount) VALUES (40, 40.4)",
+        "UPDATE items SET id = 100 WHERE id = 1",
+        "DELETE FROM items WHERE id = 2",
+    )
+    assert read_ids_and_amounts(url) == [
+        (100, "10.10"),
+        (30, "30.3"),
+        (40, "40.4"),
+    ]
+
+
+def test_sql_roundtrip_reopened_multiple_times_and_from_another_process(tmpdir):
+    import os
+    import subprocess
+    import sys
+
+    import frictionless
+
+    url, _ = make_items(tmpdir, "reopen.db")
+    execute_sql(
+        url,
+        "INSERT INTO items (id, amount) VALUES (30, 30.3)",
+        "UPDATE items SET id = 100 WHERE id = 1",
+    )
+    expected = [(100, "10.10"), (2, "20.20"), (30, "30.3")]
+    assert read_ids_and_amounts(url) == expected
+    assert read_ids_and_amounts(url) == expected
+    code = (
+        "from frictionless import Package\n"
+        f"rows = Package({url!r}).resources[0].read_rows()\n"
+        'print([(row["id"], str(row["amount"])) for row in rows])\n'
+    )
+    # Start a fresh interpreter to prove the state lives in the database
+    env = dict(os.environ)
+    root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(frictionless.__file__)))
+    )
+    env["PYTHONPATH"] = os.pathsep.join(
+        [root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(tmpdir),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(expected)
+
+
+def test_sql_roundtrip_untouched_timezone_survives_external_update(tmpdir):
+    url = make_url(tmpdir, "timezone.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "id", "type": "integer"},
+                {"name": "dt", "type": "datetime"},
+                {"name": "tm", "type": "time"},
+                {"name": "amount", "type": "number"},
+            ],
+            "primaryKey": ["id"],
+        }
+    )
+    resource = TableResource(
+        data=[
+            ["id", "dt", "tm", "amount"],
+            ["1", "2020-01-02T03:04:05+08:00", "03:04:05+08:00", "1.10"],
+        ],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(url, "UPDATE items SET amount = 2.5 WHERE id = 1")
+    row = Package(url).resources[0].read_rows()[0]
+    assert str(row["dt"]) == "2020-01-02 03:04:05+08:00"
+    assert row["dt"].utcoffset() == timedelta(hours=8)
+    assert str(row["tm"]) == "03:04:05+08:00"
+    assert row["tm"].utcoffset() == timedelta(hours=8)
+
+
+def test_sql_roundtrip_external_insert_update_to_published_value_is_not_inherited(
+    tmpdir,
+):
+    url, _ = make_items(tmpdir, "new_naive.db")
+    execute_sql_in_transaction(
+        url,
+        "INSERT INTO items (id, amount) VALUES (3, 20.2)",
+        # Same SQL value as the published row id=2: the new row must still
+        # be decoded from SQL (shortest repr), not inherit its exact value
+        "UPDATE items SET amount = 20.2 WHERE id = 3",
+    )
+    rows = Package(url).resources[0].read_rows()
+    assert str(rows[2]["amount"]) == "20.2"
+
+
+def run_random_sql_operations(url, *, rows, rng, steps=60):
+    """Apply random SQL operations, maintaining an independent oracle
+
+    The oracle tracks the row identities, their position and their expected
+    values using only the documented rules (published rows keep their exact
+    values while their SQL value is unchanged; new rows are decoded from
+    SQL). It never calls the roundtrip reader to build the expectations.
+    """
+    path = url.replace("sqlite:///", "")
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("BEGIN")
+    next_id = 1000
+    deleted_ids = []
+    try:
+        for _ in range(steps):
+            operation = rng.choice(
+                ["insert", "insert", "update_amount", "update_id", "delete"]
+            )
+            if operation == "insert" or not rows:
+                # Sometimes reuse a deleted primary key: it must be a new
+                # row at the end of the order, without the old exact value
+                if deleted_ids and rng.random() < 0.5:
+                    new_id = deleted_ids.pop(rng.randrange(len(deleted_ids)))
+                else:
+                    next_id += 1
+                    new_id = next_id
+                amount = rng.choice([0.1, 2.5, 3.14, 10.1, 20.2, 20.0, 100.0, 7, 42])
+                conn.execute(
+                    "INSERT INTO items (id, amount) VALUES (?, ?)", (new_id, amount)
+                )
+                rows.append({"id": new_id, "stored": float(amount), "exact": None})
+                continue
+            row = rng.choice(rows)
+            if operation == "delete":
+                conn.execute("DELETE FROM items WHERE id = ?", (row["id"],))
+                rows.remove(row)
+                deleted_ids.append(row["id"])
+            elif operation == "update_amount":
+                amount = rng.choice([0.1, 2.5, 3.14, 10.1, 20.2, 20.0, 100.0, 7, 42])
+                conn.execute(
+                    "UPDATE items SET amount = ? WHERE id = ?", (amount, row["id"])
+                )
+                row["stored"] = float(amount)
+            elif operation == "update_id":
+                next_id += 1
+                conn.execute("UPDATE items SET id = ? WHERE id = ?", (next_id, row["id"]))
+                row["id"] = next_id
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    result = []
+    for row in rows:
+        if row["exact"] is not None and row["stored"] == float(row["exact"]):
+            amount = row["exact"]
+        else:
+            amount = Decimal(repr(row["stored"]))
+        result.append((row["id"], amount))
+    return result
+
+
+def assert_read_rows_match(url, expected):
+    rows = Package(url).resources[0].read_rows()
+    assert [(row["id"], row["amount"]) for row in rows] == expected
+    for row, (_, amount) in zip(rows, expected):
+        assert isinstance(row["amount"], Decimal)
+        assert str(row["amount"]) == str(amount)
+
+
+def test_sql_roundtrip_random_sql_operations_with_primary_key(tmpdir):
+    import random
+
+    url, _ = make_items(tmpdir, "random_pk.db")
+    rng = random.Random(20240918)
+    rows = [
+        {"id": 1, "stored": 10.1, "exact": Decimal("10.10")},
+        {"id": 2, "stored": 20.2, "exact": Decimal("20.20")},
+    ]
+    expected = run_random_sql_operations(url, rows=rows, rng=rng)
+    assert_read_rows_match(url, expected)
+
+
+def test_sql_roundtrip_random_sql_operations_without_primary_key(tmpdir):
+    import random
+
+    url, _ = make_items(tmpdir, "random_no_pk.db", primary_key=False)
+    rng = random.Random(73192)
+    rows = [
+        {"id": 1, "stored": 10.1, "exact": Decimal("10.10")},
+        {"id": 2, "stored": 20.2, "exact": Decimal("20.20")},
+    ]
+    expected = run_random_sql_operations(url, rows=rows, rng=rng)
+    assert_read_rows_match(url, expected)
+
+
+def test_sql_roundtrip_random_sql_operations_with_rollbacks(tmpdir):
+    import random
+
+    url, _ = make_items(tmpdir, "random_rollback.db")
+    rng = random.Random(991)
+    rows = [
+        {"id": 1, "stored": 10.1, "exact": Decimal("10.10")},
+        {"id": 2, "stored": 20.2, "exact": Decimal("20.20")},
+    ]
+    path = url.replace("sqlite:///", "")
+    conn = sqlite3.connect(path, isolation_level=None)
+    next_id = 2000
+    try:
+        for _ in range(30):
+            conn.execute("BEGIN")
+            rollback = rng.random() < 0.5
+            local_rows = [dict(row) for row in rows]
+            for _ in range(rng.randint(1, 4)):
+                row = rng.choice(local_rows)
+                if rng.random() < 0.5:
+                    next_id += 1
+                    amount = rng.choice([1.5, 10.1, 20.2, 33.0])
+                    conn.execute(
+                        "INSERT INTO items (id, amount) VALUES (?, ?)",
+                        (next_id, amount),
+                    )
+                    local_rows.append(
+                        {"id": next_id, "stored": float(amount), "exact": None}
+                    )
+                else:
+                    next_id += 1
+                    conn.execute(
+                        "UPDATE items SET id = ? WHERE id = ?",
+                        (next_id, row["id"]),
+                    )
+                    row["id"] = next_id
+            conn.execute("ROLLBACK" if rollback else "COMMIT")
+            if not rollback:
+                rows = local_rows
+    finally:
+        conn.close()
+
+    expected = [
+        (
+            row["id"],
+            row["exact"]
+            if row["exact"] is not None and row["stored"] == float(row["exact"])
+            else Decimal(repr(row["stored"])),
+        )
+        for row in rows
+    ]
+    assert_read_rows_match(url, expected)
+
+
+def test_sql_roundtrip_legacy_metadata_without_external_changes(tmpdir):
+    """A database published by an older version still reads back exactly
+
+    Legacy metadata identified published rows by their rowid only and had
+    no triggers. Such a database cannot track rows changed by other tools,
+    but an unmodified one must still restore its exact values.
+    """
+    url, _ = make_items(tmpdir, "legacy.db")
+    path = url.replace("sqlite:///", "")
+    conn = sqlite3.connect(path)
+    try:
+        rowids = conn.execute("SELECT rowid, id FROM items ORDER BY rowid").fetchall()
+        cells = conn.execute(
+            "SELECT seq, cells FROM _frictionless_rows ORDER BY seq"
+        ).fetchall()
+        conn.execute("DROP TRIGGER IF EXISTS _frictionless_items_insert")
+        conn.execute("DROP TRIGGER IF EXISTS _frictionless_items_update")
+        conn.execute("DROP TRIGGER IF EXISTS _frictionless_items_delete")
+        conn.execute("DROP TABLE _frictionless_rows")
+        conn.execute(
+            "CREATE TABLE _frictionless_rows ("
+            "resource TEXT NOT NULL, rowid INTEGER NOT NULL, "
+            "seq INTEGER NOT NULL, cells TEXT NOT NULL, "
+            "PRIMARY KEY (resource, rowid))"
+        )
+        by_seq = {seq: text for seq, text in cells}
+        conn.executemany(
+            "INSERT INTO _frictionless_rows (resource, rowid, seq, cells) "
+            "VALUES ('items', ?, ?, ?)",
+            [
+                (rid, index + 1, by_seq[index + 1])
+                for index, (rid, _) in enumerate(rowids)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # No triggers exist any more: the legacy layout is detected and read
+    assert read_sql(url, "SELECT name FROM sqlite_master WHERE type='trigger'") == []
+    assert read_ids_and_amounts(url) == [(1, "10.10"), (2, "20.20")]
+
+
+def test_sql_roundtrip_legacy_metadata_cannot_track_external_identity_changes(
+    tmpdir,
+):
+    """The documented legacy limitation: row identity changes are untracked"""
+    url, _ = make_items(tmpdir, "legacy_changed.db")
+    path = url.replace("sqlite:///", "")
+    conn = sqlite3.connect(path)
+    try:
+        rowids = conn.execute("SELECT rowid, id FROM items ORDER BY rowid").fetchall()
+        cells = conn.execute(
+            "SELECT seq, cells FROM _frictionless_rows ORDER BY seq"
+        ).fetchall()
+        conn.execute("DROP TRIGGER IF EXISTS _frictionless_items_insert")
+        conn.execute("DROP TRIGGER IF EXISTS _frictionless_items_update")
+        conn.execute("DROP TRIGGER IF EXISTS _frictionless_items_delete")
+        conn.execute("DROP TABLE _frictionless_rows")
+        conn.execute(
+            "CREATE TABLE _frictionless_rows ("
+            "resource TEXT NOT NULL, rowid INTEGER NOT NULL, "
+            "seq INTEGER NOT NULL, cells TEXT NOT NULL, "
+            "PRIMARY KEY (resource, rowid))"
+        )
+        by_seq = {seq: text for seq, text in cells}
+        conn.executemany(
+            "INSERT INTO _frictionless_rows (resource, rowid, seq, cells) "
+            "VALUES ('items', ?, ?, ?)",
+            [
+                (rid, index + 1, by_seq[index + 1])
+                for index, (rid, _) in enumerate(rowids)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # An old database has no operation history, so updating the integer
+    # primary key cannot be distinguished from a delete plus an insert: the
+    # row moves to the appended rows and loses its exact value (10.1 rather
+    # than 10.10). This is the documented limitation of legacy databases.
+    execute_sql(url, "UPDATE items SET id = 100 WHERE id = 1")
+    rows = Package(url).resources[0].read_rows()
+    assert [(row["id"], str(row["amount"])) for row in rows] == [
+        (2, "20.20"),
+        (100, "10.1"),
+    ]
+
+
+def test_sql_roundtrip_identical_rows_stay_distinct(tmpdir):
+    url = make_url(tmpdir, "identical.db")
+    schema = Schema.from_descriptor({"fields": [{"name": "amount", "type": "number"}]})
+    resource = TableResource(
+        data=[["amount"], ["1.10"], ["1.10"]], schema=schema, name="items"
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    execute_sql(
+        url,
+        "INSERT INTO items (amount) VALUES (1.10)",
+    )
+    rows = Package(url).resources[0].read_rows()
+    assert [str(row["amount"]) for row in rows] == ["1.10", "1.10", "1.1"]
+
+
+def test_sql_roundtrip_each_resource_has_its_own_history(tmpdir):
+    url = make_url(tmpdir, "two_resources.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "id", "type": "integer"},
+                {"name": "amount", "type": "number"},
+            ],
+            "primaryKey": ["id"],
+        }
+    )
+    first = TableResource(
+        data=[["id", "amount"], ["1", "1.10"]], schema=schema, name="first"
+    )
+    second = TableResource(
+        data=[["id", "amount"], ["1", "2.20"]], schema=schema, name="second"
+    )
+    Package(resources=[first, second]).publish(
+        url, control=formats.SqlControl(roundtrip=True)
+    )
+    execute_sql(
+        url,
+        "UPDATE first SET id = 10 WHERE id = 1",
+        "INSERT INTO second (id, amount) VALUES (2, 3.3)",
+    )
+    target = Package(url)
+    assert [
+        (row["id"], str(row["amount"])) for row in target.resources[0].read_rows()
+    ] == [(10, "1.10")]
+    assert [
+        (row["id"], str(row["amount"])) for row in target.resources[1].read_rows()
+    ] == [
+        (1, "2.20"),
+        (2, "3.3"),
+    ]
+
+
+def test_sql_roundtrip_existing_history_index_clash_is_rejected(tmpdir):
+    url = make_url(tmpdir, "index_clash.db")
+    execute_sql(
+        url,
+        "CREATE TABLE preexisting (id INTEGER)",
+        "CREATE INDEX _frictionless_rows_seq ON preexisting (id)",
+    )
+    schema = Schema.from_descriptor({"fields": [{"name": "id", "type": "integer"}]})
+    resource = TableResource(data=[["id"], ["1"]], schema=schema, name="t")
+    with pytest.raises(FrictionlessException) as excinfo:
+        Package(resources=[resource]).publish(
+            url, control=formats.SqlControl(roundtrip=True)
+        )
+    assert "_frictionless_rows_seq" in str(excinfo.value)
+    # The database is unchanged apart from the pre-existing objects
+    assert read_sql(url, "SELECT name FROM sqlite_master WHERE type='table'") == [
+        ("preexisting",)
+    ]
+
+
+def test_sql_roundtrip_existing_history_trigger_clash_is_rejected(tmpdir):
+    url = make_url(tmpdir, "trigger_clash.db")
+    execute_sql(
+        url,
+        "CREATE TABLE preexisting (id INTEGER)",
+        "CREATE TRIGGER _frictionless_t_insert AFTER INSERT ON preexisting "
+        "BEGIN SELECT 1; END",
+    )
+    schema = Schema.from_descriptor({"fields": [{"name": "id", "type": "integer"}]})
+    resource = TableResource(data=[["id"], ["1"]], schema=schema, name="t")
+    with pytest.raises(FrictionlessException) as excinfo:
+        Package(resources=[resource]).publish(
+            url, control=formats.SqlControl(roundtrip=True)
+        )
+    assert "_frictionless_t_insert" in str(excinfo.value)
+
+
+def test_sql_roundtrip_real_primary_key_identity_is_exact(tmpdir):
+    """A REAL primary key (shadowing all rowid aliases) is identified exactly
+
+    SQLite renders two adjacent doubles with the same 15-digit text, so an
+    identity built from ``hex`` would collide. The identity uses 17
+    significant digits instead.
+    """
+    url = make_url(tmpdir, "real_pk.db")
+    schema = Schema.from_descriptor(
+        {
+            "fields": [
+                {"name": "rowid", "type": "string"},
+                {"name": "_rowid_", "type": "string"},
+                {"name": "oid", "type": "number"},
+                {"name": "amount", "type": "string"},
+            ],
+            "primaryKey": ["oid"],
+        }
+    )
+    resource = TableResource(
+        data=[
+            ["rowid", "_rowid_", "oid", "amount"],
+            ["a", "x", "0.1", "first"],
+            ["b", "y", "0.09999999999999999", "second"],
+        ],
+        schema=schema,
+        name="items",
+    )
+    Package(resources=[resource]).publish(url, control=formats.SqlControl(roundtrip=True))
+    rows = Package(url).resources[0].read_rows()
+    # Both rows keep their own exact amount (the identity did not collide)
+    assert [(row["oid"], row["amount"]) for row in rows] == [
+        (Decimal("0.1"), "first"),
+        (Decimal("0.09999999999999999"), "second"),
+    ]
