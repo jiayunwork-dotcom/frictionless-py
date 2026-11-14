@@ -54,6 +54,14 @@ class SqlControl(Control):
     _rowNumber or _rowValid
     """
 
+    roundtrip: bool = False
+    """
+    Indicates if the package should be published in a lossless roundtrip
+    mode (SQLite only). When enabled, `package.publish(url, control=...)`
+    stores the package descriptor and the exact cell values in the database
+    so that `Package(url)` restores the package without any loss.
+    """
+
     # Metadata
 
     metadata_profile_patch = {
@@ -65,5 +73,6 @@ class SqlControl(Control):
             "namespace": {"type": "string"},
             "basepath": {"type": "string"},
             "withMetadata": {"type": "boolean"},
+            "roundtrip": {"type": "boolean"},
         },
     }

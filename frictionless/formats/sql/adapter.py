@@ -7,7 +7,7 @@ from ...package import Package
 from ...platform import platform
 from ...resource import Resource
 from ...system import Adapter, PublishResult
-from . import settings
+from . import roundtrip, settings
 from .control import SqlControl
 from .mapper import SqlMapper
 
@@ -51,6 +51,8 @@ class SqlAdapter(Adapter):
     # Read
 
     def read_package(self) -> Package:
+        if settings.ROUNDTRIP_PACKAGE_TABLE in self.metadata.tables:
+            return roundtrip.read_package(self)
         package = Package(resources=[])
         for table in self.metadata.sorted_tables:
             name = str(table.name)
@@ -66,6 +68,9 @@ class SqlAdapter(Adapter):
         return self.mapper.read_schema(table, with_metadata=self.control.with_metadata)
 
     def read_cell_stream(self, control: SqlControl) -> Generator[List[Any], None, None]:
+        if control.roundtrip:
+            yield from roundtrip.read_cell_stream(self, control)
+            return
         sa = platform.sqlalchemy
         table = self.metadata.tables[control.table]  # type: ignore
         with self.engine.begin() as conn:
@@ -97,6 +102,8 @@ class SqlAdapter(Adapter):
     # Write
 
     def write_package(self, package: Package):
+        if self.control.roundtrip:
+            return roundtrip.write_package(self, package)
         with self.engine.begin() as conn:
             tables: List[Table] = []
             for res in package.resources:
@@ -189,6 +196,8 @@ class SqlAdapter(Adapter):
 # Internal
 
 
-def regexp(expr: str, item: str):
+def regexp(expr: Optional[str], item: Optional[str]):
+    if expr is None or item is None:
+        return None
     reg = re.compile(expr)
     return reg.search(item) is not None

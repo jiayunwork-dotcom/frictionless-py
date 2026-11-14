@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from ...exception import FrictionlessException
 from ...platform import platform
 from ...system import Parser
+from . import roundtrip
 from .adapter import SqlAdapter
 from .control import SqlControl
 
@@ -36,7 +37,10 @@ class SqlParser(Parser):
         adapter = SqlAdapter(engine, control=control)
         if not adapter:
             raise FrictionlessException(f"Not supported source: {self.resource.normpath}")
-        if not self.resource.schema:
+        if control.roundtrip:
+            if not self.resource.schema:
+                self.resource.schema = roundtrip.read_schema(adapter, control.table)
+        elif not self.resource.schema:
             self.resource.schema = adapter.read_schema(control.table)
         return adapter.read_cell_stream(control)
 
