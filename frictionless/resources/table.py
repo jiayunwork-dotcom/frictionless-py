@@ -311,10 +311,12 @@ class TableResource(Resource):
             for row_number, cells in enumerated_content_stream:
                 self.stats.rows += 1
 
+                source = getattr(cells, "source", None)
                 row = Row(
                     cells,
                     field_info=field_info,
                     row_number=row_number,
+                    source=source,
                 )
 
                 # Unique Error

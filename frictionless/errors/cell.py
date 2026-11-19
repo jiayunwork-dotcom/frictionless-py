@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import attrs
 
@@ -39,6 +39,14 @@ class CellError(RowError):
     Index of the field that has an error.
     """
 
+    source: Optional[Dict[str, Any]] = None
+    """
+    Source positions for the error, in the form
+    ``{"record": range, "cell": range | None}``. The ``cell`` range points at
+    the offending token and is ``None`` for a missing cell (no token). Omitted
+    entirely when source tracking is disabled or unavailable.
+    """
+
     # Convert
 
     @classmethod
@@ -66,6 +74,7 @@ class CellError(RowError):
                     cell=str(cell),
                     field_name=field_name,
                     field_number=field_number,
+                    source=row_cell_source(row, field_number),
                 )
         raise FrictionlessException(f"Field {field_name} is not in the row")
 
@@ -76,8 +85,26 @@ class CellError(RowError):
             "cell": {"type": "string"},
             "fieldName": {"type": "string"},
             "fieldNumber": {"type": "integer"},
+            "source": {"type": ["object", "null"]},
         },
     }
+
+
+def row_cell_source(row: Row, field_number: int) -> Optional[Dict[str, Any]]:
+    """Build the record + cell source descriptor for a cell error.
+
+    A missing cell has no source token, so its ``cell`` range is ``None``;
+    an extra cell points at its real (beyond-schema) source range.
+    """
+    row_source = getattr(row, "source", None)
+    if row_source is None:
+        return None
+    cell_range = None
+    cells = row_source.get("cells") or []
+    index = field_number - 1
+    if 0 <= index < len(cells):
+        cell_range = cells[index]
+    return {"record": row_source["record"], "cell": cell_range}
 
 
 class ExtraCellError(CellError):

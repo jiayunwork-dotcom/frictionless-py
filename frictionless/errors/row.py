@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import attrs
 
@@ -35,6 +35,13 @@ class RowError(TableError):
     Index of the row that has an error.
     """
 
+    source: Optional[Dict[str, Any]] = None
+    """
+    Source position of the record, in the form
+    ``{"record": [[line, column], [line, column]]}``. Omitted from the
+    descriptor when source tracking is disabled or unavailable.
+    """
+
     # Convert
 
     @classmethod
@@ -45,6 +52,7 @@ class RowError(TableError):
             note=note,
             cells=list(map(to_str, row.cells)),  # type: ignore
             row_number=row.row_number,
+            source=row_source_record(row),
         )
 
     # Metadata
@@ -53,9 +61,17 @@ class RowError(TableError):
         "properties": {
             "cells": {"type": "array", "items": {"type": "string"}},
             "rowNumber": {"type": "integer"},
+            "source": {"type": "object"},
         },
     }
 
+
+def row_source_record(row: Row) -> Optional[Dict[str, Any]]:
+    """Build the record-only source descriptor for a row error."""
+    row_source = getattr(row, "source", None)
+    if row_source is None:
+        return None
+    return {"record": row_source["record"]}
 
 class BlankRowError(RowError):
     type = "blank-row"
@@ -115,6 +131,7 @@ class ForeignKeyError(RowError):
             note=note,
             cells=list(map(to_str, row.cells)),  # type: ignore
             row_number=row.row_number,
+            source=row_source_record(row),
             field_names=field_names,
             field_cells=list(map(to_str, field_values)),  # type: ignore
             reference_name=reference_name,

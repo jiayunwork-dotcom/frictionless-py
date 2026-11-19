@@ -5,13 +5,20 @@ import tempfile
 from itertools import chain
 from typing import TYPE_CHECKING
 
+from ... import errors
+from ...exception import FrictionlessException
 from ...system import Parser, system
 from . import settings
 from .control import CsvControl
+from .tracker import TrackingCsvReader
 
 if TYPE_CHECKING:
     from ... import types
     from ...resources import TableResource
+
+
+# Encodings for which decoded positions map unambiguously onto the source text
+TRACKABLE_ENCODINGS = ["utf-8", "utf-8-sig"]
 
 
 class CsvParser(Parser):
@@ -46,7 +53,27 @@ class CsvParser(Parser):
             "skip_initial_space", config.skipinitialspace, distinct=True
         )
         source = chain(sample, self.loader.text_stream)
-        data = csv.reader(source, dialect=control.to_python())  # type: ignore
+        if control.track_source:
+            # Position tracking requires a codec whose decoded characters are a
+            # faithful representation of the source; reject other encodings
+            # explicitly rather than reporting approximate locations
+            encoding = (self.resource.encoding or "").lower()
+            if encoding not in TRACKABLE_ENCODINGS:
+                note = (
+                    'source tracking requires "utf-8" or "utf-8-sig" encoding;'
+                    f' got "{self.resource.encoding}"'
+                )
+                raise FrictionlessException(errors.EncodingError(note=note))
+            data = TrackingCsvReader(
+                source,
+                delimiter=control.delimiter,
+                quote_char=control.quote_char,
+                escape_char=control.escape_char,
+                skip_initial_space=control.skip_initial_space,
+                double_quote=control.double_quote if not control.escape_char else True,
+            )
+        else:
+            data = csv.reader(source, dialect=control.to_python())  # type: ignore
         yield from data
 
     # Write
@@ -91,5 +118,5 @@ def extract_samle(text_stream: types.ITextStream) -> types.ISample:
 
 # System
 
-# https://stackoverflow.com/a/54515177
+# https://stackoverflow.com/a/54517177
 csv.field_size_limit(settings.FIELD_SIZE_LIMIT)

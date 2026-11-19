@@ -64,6 +64,15 @@ class CsvControl(Control):
     For example space in header(in csv file): "Name", "Team"
     """
 
+    track_source: bool = False
+    """
+    When enabled, the parser records the source position (line and column in
+    the decoded text) of every record and field. The positions are exposed on
+    ``Row.source`` and on validation errors. Only UTF-8 and UTF-8-SIG encoded
+    resources are supported with tracking enabled; other encodings are rejected
+    explicitly. Default value is False.
+    """
+
     # Convert
 
     def to_python(self):
@@ -89,5 +98,6 @@ class CsvControl(Control):
             "escapeChar": {"type": "string"},
             "nullSequence": {"type": "string"},
             "skipInitialSpace": {"type": "boolean"},
+            "trackSource": {"type": "boolean"},
         },
     }

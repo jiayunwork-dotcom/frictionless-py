@@ -38,10 +38,15 @@ class Row(Dict[str, Any]):
         *,
         field_info: Dict[str, Any],
         row_number: int,
+        source: Optional[Dict[str, Any]] = None,
     ):
         self.__cells = cells
         self.__field_info = field_info
         self.__row_number = row_number
+        # Snapshot of the record/field positions in the decoded source text.
+        # Stored independently from the cells so later value mutations never
+        # change the original location; None when tracking is disabled.
+        self.__source = source
         self.__processed: bool = False
         self.__blank_cells: Dict[str, Any] = {}
         self.__error_cells: Dict[str, Any] = {}
@@ -139,6 +144,19 @@ class Row(Dict[str, Any]):
             int: row number from 1
         """
         return self.__row_number
+
+    @cached_property
+    def source(self) -> Optional[Dict[str, Any]]:
+        """Source positions of the record and its original fields.
+
+        Returns:
+            dict?: ``{"record": [start, end], "cells": [[start, end], ...]}``
+            where the cell ranges follow the original field order (which may
+            include extra cells beyond the schema fields), or ``None`` when
+            source tracking is disabled. Converting the row to a dict or list
+            only exposes data columns and never this metadata.
+        """
+        return self.__source
 
     @cached_property
     def blank_cells(self):
@@ -308,6 +326,7 @@ class Row(Dict[str, Any]):
                         cell=str(source),
                         field_name=field.name,
                         field_number=field_number,
+                        source=self.__cell_source(field_number),
                     )
                 )
 
@@ -322,6 +341,7 @@ class Row(Dict[str, Any]):
                             cell=str(source),
                             field_name=field.name,
                             field_number=field_number,
+                            source=self.__cell_source(field_number),
                         )
                     )
 
@@ -343,6 +363,7 @@ class Row(Dict[str, Any]):
                         cell=str(cell),
                         field_name="",
                         field_number=field_number,
+                        source=self.__cell_source(field_number),
                     )
                 )
 
@@ -360,6 +381,7 @@ class Row(Dict[str, Any]):
                             cell="",
                             field_name=field.name,
                             field_number=field_number,
+                            source=self.__cell_source(field_number),
                         )
                     )
 
@@ -370,8 +392,26 @@ class Row(Dict[str, Any]):
                     note="",
                     cells=list(map(to_str, cells)),  # type: ignore
                     row_number=self.__row_number,
+                    source=self.__record_source(),
                 )
             ]
 
         # Set processed
         self.__processed = True
+
+    # Source
+
+    def __record_source(self) -> Optional[Dict[str, Any]]:
+        if self.__source is None:
+            return None
+        return {"record": self.__source["record"]}
+
+    def __cell_source(self, field_number: int) -> Optional[Dict[str, Any]]:
+        if self.__source is None:
+            return None
+        cell_range = None
+        cell_ranges = self.__source.get("cells") or []
+        index = field_number - 1
+        if 0 <= index < len(cell_ranges):
+            cell_range = cell_ranges[index]
+        return {"record": self.__source["record"], "cell": cell_range}

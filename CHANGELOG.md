@@ -2,6 +2,13 @@
 
 Here described only the breaking and most significant changes. The full changelog and documentation for all released versions could be found in nicely formatted [commit history](https://github.com/frictionlessdata/frictionless-py/commits/main).
 
+## Unreleased
+
+- feat: optional CSV/TSV source position tracking via `CsvControl(track_source=True)`
+  (serialized as `trackSource`). When enabled, `Row.source` and validation
+  errors carry line/column ranges of the originating record and cells. Only
+  UTF-8 and UTF-8-SIG encodings are supported; other encodings are rejected.
+
 ## v5.18.1
 
 - feat: add pass_row as configurable parameter for field_update 
