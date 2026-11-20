@@ -483,6 +483,12 @@ class Package(Metadata, metaclass=Factory):
         Returns:
             Report: validation report
 
+        When temporal foreign keys (`temporalForeignKeys`) are declared, the
+        whole package is validated in a single sequential pass and
+        `parallel=True`, a non-empty `name` and `limit_rows` are rejected
+        before any source is read. Every involved resource is read exactly
+        once; `limit_errors` only bounds the amount of stored errors.
+
         """
         # Create state
         timer = helpers.Timer()
@@ -491,6 +497,23 @@ class Package(Metadata, metaclass=Factory):
         with_foreign_keys = any(
             res.schema and res.schema.foreign_keys for res in resources
         )
+        with_temporal_keys = any(
+            res.schema and res.schema.temporal_foreign_keys for res in resources
+        )
+
+        # Temporal foreign keys require a single sequential pass over all the
+        # resources; the unsupported options are rejected before any source
+        # is read (calls without temporal declarations are not restricted)
+        if with_temporal_keys:
+            if parallel:
+                note = "parallel validation is not supported with temporal foreign keys"
+                raise FrictionlessException(errors.PackageError(note=note))
+            if name is not None:
+                note = "validating a single resource is not supported with temporal foreign keys"
+                raise FrictionlessException(errors.PackageError(note=note))
+            if limit_rows is not None:
+                note = "limiting rows is not supported with temporal foreign keys"
+                raise FrictionlessException(errors.PackageError(note=note))
 
         # Prepare checklist
         checklist = checklist or Checklist()
@@ -500,6 +523,15 @@ class Package(Metadata, metaclass=Factory):
             self.to_descriptor(validate=True)
         except FrictionlessException as exception:
             return Report.from_validation(time=timer.time, errors=exception.to_errors())
+
+        # Validate temporal
+        if with_temporal_keys:
+            return self.__validate_temporal(
+                checklist=checklist,
+                resources=resources,
+                limit_errors=limit_errors,
+                timer=timer,
+            )
 
         # Validate sequential
         if not parallel or with_foreign_keys:
@@ -527,6 +559,80 @@ class Package(Metadata, metaclass=Factory):
                 report_descriptors = pool.map(_validate_parallel, options_pool)
                 for report_descriptor in report_descriptors:
                     reports.append(Report.from_descriptor(report_descriptor))
+
+        # Return report
+        return Report.from_validation_reports(
+            time=timer.time,
+            reports=reports,
+        )
+
+    def __validate_temporal(
+        self: Package,
+        *,
+        checklist: Checklist,
+        resources: List[Resource],
+        limit_errors: int,
+        timer: Any,
+    ):
+        """Validate package with temporal foreign keys
+
+        Every involved resource is read exactly once during its own
+        validation pass; the temporal engine stages the decoded values and
+        emits the deferred relation errors once all the resources are read.
+        """
+        from ..temporal import TemporalEngine
+
+        reports: List[Report] = []
+        try:
+            engine = TemporalEngine(self)
+        except FrictionlessException as exception:
+            return Report.from_validation(time=timer.time, errors=exception.to_errors())
+        try:
+            # Validate the resources (fully reading the involved ones)
+            for resource in resources:
+                involved = engine.is_involved(resource.name)
+                report = resource.validate(
+                    checklist=checklist,
+                    # Involved resources are read to the end so the relation
+                    # views are complete; the error limit only bounds the
+                    # amount of stored errors and is applied below
+                    limit_errors=0 if involved else limit_errors,
+                    on_row=engine.make_row_callback(resource.name),
+                )
+                reports.append(report)
+
+            # Run the temporal joins
+            budgets: Dict[str, Optional[int]] = {}
+            for report in reports:
+                task = report.tasks[0]
+                if limit_errors:
+                    budgets[task.name] = max(0, limit_errors - len(task.errors))
+                else:
+                    budgets[task.name] = None
+            temporal_errors = engine.finalize(budgets)
+
+            # Merge the deferred errors into the resource tasks
+            for report in reports:
+                task = report.tasks[0]
+                errors, truncated = temporal_errors.get(task.name, ([], False))
+                for error in errors:
+                    if checklist.match(error):
+                        task.errors.append(error)
+                list_truncated = False
+                if limit_errors and len(task.errors) > limit_errors:
+                    task.errors = task.errors[:limit_errors]
+                    list_truncated = True
+                if list_truncated or (
+                    truncated and limit_errors and len(task.errors) >= limit_errors
+                ):
+                    warning = f"reached error limit: {limit_errors}"
+                    if warning not in task.warnings:
+                        task.warnings.append(warning)
+                task.valid = not task.errors
+                task.stats["errors"] = len(task.errors)
+                task.stats["warnings"] = len(task.warnings)
+        finally:
+            engine.cleanup()
 
         # Return report
         return Report.from_validation_reports(
@@ -678,6 +784,60 @@ class Package(Metadata, metaclass=Factory):
         if len(resource_names) != len(set(resource_names)):
             note = "names of the resources are not unique"
             yield errors.PackageError(note=note)
+
+        # Temporal Foreign Keys
+        from ..temporal.declaration import (
+            list_field_types,
+            read_temporal_declaration,
+            validate_temporal_declaration,
+        )
+
+        resource_descriptors: Dict[str, Dict[str, Any]] = {}
+        for resource_item in descriptor["resources"]:
+            if isinstance(resource_item, dict):
+                resource_descriptor: Dict[str, Any] = resource_item
+                resource_name = resource_descriptor.get("name")
+                if isinstance(resource_name, str):
+                    resource_descriptors[resource_name] = resource_descriptor
+        for resource_item in descriptor["resources"]:
+            if not isinstance(resource_item, dict):
+                continue
+            resource_descriptor = resource_item
+            schema = resource_descriptor.get("schema")
+            if not isinstance(schema, dict):
+                continue
+            schema_descriptor: Dict[str, Any] = schema
+            field_types = list_field_types(schema_descriptor)
+            for tfk_item in schema_descriptor.get("temporalForeignKeys", []):
+                if not isinstance(tfk_item, dict):
+                    continue
+                tfk: Dict[str, Any] = tfk_item
+                declaration = read_temporal_declaration(tfk)
+                name = declaration["resource"]
+                if not name:
+                    # Self references are checked by the schema level validation
+                    continue
+                target = resource_descriptors.get(name)
+                if target is None:
+                    note = 'temporal foreign key resource "%s" does not exist'
+                    yield errors.PackageError(note=note % name)
+                    continue
+                target_type = target.get("type")
+                if target_type is not None and target_type != "table":
+                    note = 'temporal foreign key resource "%s" is not tabular'
+                    yield errors.PackageError(note=note % name)
+                    continue
+                target_schema = target.get("schema")
+                if not isinstance(target_schema, dict):
+                    # External schema references are verified when validated
+                    continue
+                target_schema_descriptor: Dict[str, Any] = target_schema
+                for note in validate_temporal_declaration(
+                    declaration,
+                    field_types=field_types,
+                    reference_field_types=list_field_types(target_schema_descriptor),
+                ):
+                    yield errors.PackageError(note=note)
 
         # Created
         created = descriptor.get("created")

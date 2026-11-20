@@ -4,6 +4,14 @@ Here described only the breaking and most significant changes. The full changelo
 
 ## Unreleased
 
+- feat: temporal foreign keys via `temporalForeignKeys` schema property.
+  Every fact row is validated to match exactly one version row of the
+  referenced resource that is valid at the fact's business moment
+  (left-closed, right-open intervals). Adds the `temporal-time`,
+  `temporal-interval`, `temporal-key-missing` and `temporal-key-ambiguous`
+  error types. With temporal declarations `Package.validate` rejects
+  `parallel=True`, a non-empty `name` and `limit_rows` before reading any
+  source; `limit_errors` only bounds the amount of stored errors.
 - feat: optional CSV/TSV source position tracking via `CsvControl(track_source=True)`
   (serialized as `trackSource`). When enabled, `Row.source` and validation
   errors carry line/column ranges of the originating record and cells. Only

@@ -78,6 +78,27 @@ class Schema(Metadata, metaclass=Factory):
     Specifies the foreign keys for the schema.
     """
 
+    temporal_foreign_keys: List[Dict[str, Any]] = attrs.field(factory=list)
+    """
+    Specifies the temporal foreign keys for the schema.
+
+    Every declaration relates a fact row of this table to exactly one
+    version row of a referenced table that is valid at the fact's moment:
+
+    ```python
+    {
+        "fields": ["product"],
+        "at": "occurred",
+        "reference": {
+            "resource": "versions",
+            "fields": ["product"],
+            "validFrom": "begin",
+            "validTo": "end",
+        },
+    }
+    ```
+    """
+
     def __attrs_post_init__(self):
         for field in self.fields:
             field.schema = self
@@ -317,6 +338,25 @@ class Schema(Metadata, metaclass=Factory):
                     },
                 },
             },
+            "temporalForeignKeys": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "fields": {"type": "array", "items": {"type": "string"}},
+                        "at": {"type": "string"},
+                        "reference": {
+                            "type": "object",
+                            "properties": {
+                                "resource": {"type": "string"},
+                                "fields": {"type": "array", "items": {"type": "string"}},
+                                "validFrom": {"type": "string"},
+                                "validTo": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
         },
     }
 
@@ -349,6 +389,23 @@ class Schema(Metadata, metaclass=Factory):
                     fk["fields"] = [fk["fields"]]
                 if not isinstance(fk["reference"]["fields"], list):
                     fk["reference"]["fields"] = [fk["reference"]["fields"]]
+
+        # Temporal Foreign Keys (framework/v5)
+        temporal_foreign_keys = descriptor.get("temporalForeignKeys")
+        if temporal_foreign_keys:
+            for tfk in temporal_foreign_keys:
+                if not isinstance(tfk, dict):
+                    continue
+                tfk.setdefault("fields", [])  # type: ignore
+                tfk.setdefault("at", "")  # type: ignore
+                tfk.setdefault("reference", {})  # type: ignore
+                tfk["reference"].setdefault("resource", "")  # type: ignore
+                tfk["reference"].setdefault("fields", [])  # type: ignore
+                tfk["reference"].setdefault("validFrom", "")  # type: ignore
+                if not isinstance(tfk["fields"], list):
+                    tfk["fields"] = [tfk["fields"]]
+                if not isinstance(tfk["reference"]["fields"], list):
+                    tfk["reference"]["fields"] = [tfk["reference"]["fields"]]
 
     @classmethod
     def metadata_validate(cls, descriptor: types.IDescriptor):  # type: ignore
@@ -385,4 +442,28 @@ class Schema(Metadata, metaclass=Factory):
             if len(fk["fields"]) != len(fk["reference"]["fields"]):
                 note = 'foreign key fields "%s" does not match the reference fields "%s"'
                 note = note % (fk["fields"], fk["reference"]["fields"])
+                yield errors.SchemaError(note=note)
+
+        # Temporal Foreign Keys
+        from ..temporal.declaration import (
+            list_field_types,
+            read_temporal_declaration,
+            validate_temporal_declaration,
+        )
+
+        field_types = list_field_types(descriptor)
+        tfks = descriptor.get("temporalForeignKeys", [])
+        for tfk_item in tfks:
+            if not isinstance(tfk_item, dict):
+                continue
+            tfk: Dict[str, Any] = tfk_item
+            declaration = read_temporal_declaration(tfk)
+            # Self referenced declarations are checked against the same schema;
+            # named references are checked by the package level validation
+            is_self = not declaration["resource"]
+            for note in validate_temporal_declaration(
+                declaration,
+                field_types=field_types,
+                reference_field_types=field_types if is_self else None,
+            ):
                 yield errors.SchemaError(note=note)

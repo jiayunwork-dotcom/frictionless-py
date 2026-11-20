@@ -42,6 +42,11 @@ class baseline(Check):
         errors.BlankRowError,
         errors.PrimaryKeyError,
         errors.ForeignKeyError,
+        # Temporal
+        errors.TemporalTimeError,
+        errors.TemporalIntervalError,
+        errors.TemporalKeyMissingError,
+        errors.TemporalKeyAmbiguousError,
         # Cell
         errors.ExtraCellError,
         errors.MissingCellError,

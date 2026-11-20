@@ -20,4 +20,6 @@
 references:
   - frictionless.errors.RowError
   - frictionless.errors.ForeignKeyError
+  - frictionless.errors.TemporalError
+  - frictionless.errors.TemporalKeyError
 ```
