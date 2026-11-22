@@ -46,20 +46,27 @@ class Indexer:
 
     def index(self) -> Optional[Report]:
         self.prepare_resource()
-        with self.resource:
-            # Index is resouce-based operation not supporting FKs
-            if self.resource.schema.foreign_keys:
-                self.resource.schema.foreign_keys = []
-            self.create_table()
-            while True:
-                try:
-                    return self.populate_table()
-                except Exception:
-                    if self.fast and self.use_fallback:
-                        self.fast = False
-                        continue
-                    self.delete_table()
-                    raise
+        # Index is a resource-based operation not supporting FKs; suppress
+        # the foreign key lookup for this opening and restore the declared
+        # relations afterwards instead of dropping them permanently
+        foreign_keys = self.resource.schema.foreign_keys
+        if foreign_keys:
+            self.resource.schema.foreign_keys = []
+        try:
+            with self.resource:
+                self.create_table()
+                while True:
+                    try:
+                        return self.populate_table()
+                    except Exception:
+                        if self.fast and self.use_fallback:
+                            self.fast = False
+                            continue
+                        self.delete_table()
+                        raise
+        finally:
+            if foreign_keys:
+                self.resource.schema.foreign_keys = foreign_keys
 
     def prepare_resource(self):
         if self.qsv_path:

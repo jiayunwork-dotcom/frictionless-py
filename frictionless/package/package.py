@@ -13,6 +13,7 @@ from ..metadata import Metadata
 from ..platform import platform
 from ..report import Report
 from ..resource import Resource
+from ..resource.lookup import LookupScope
 from ..system import system
 from ..transformer import Transformer
 from .factory import Factory
@@ -503,13 +504,20 @@ class Package(Metadata, metaclass=Factory):
 
         # Validate sequential
         if not parallel or with_foreign_keys:
-            for resource in resources:
-                report = resource.validate(
-                    checklist=checklist,
-                    limit_errors=limit_errors,
-                    limit_rows=limit_rows,
-                )
-                reports.append(report)
+            # All the resources share one lookup scope so that a target
+            # referenced by several resources is scanned only once; the
+            # collected keys are released at the end of the validation
+            with LookupScope() as scope:
+                for resource in resources:
+                    if resource.tabular:
+                        scope.register_resource(resource)  # type: ignore
+                for resource in resources:
+                    report = resource.validate(
+                        checklist=checklist,
+                        limit_errors=limit_errors,
+                        limit_rows=limit_rows,
+                    )
+                    reports.append(report)
 
         # Validate parallel
         else:

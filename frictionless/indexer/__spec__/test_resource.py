@@ -1,7 +1,7 @@
 import pytest
 from pytest_lazy_fixtures import lf
 
-from frictionless import formats, platform
+from frictionless import Schema, formats, platform
 from frictionless.resources import TableResource
 
 control = formats.sql.SqlControl(table="table")
@@ -94,3 +94,35 @@ def test_resource_index_sqlite_on_progress(database_url, mocker):
     assert on_progress.call_count == 2
     on_progress.assert_any_call(control.table, "2 rows")
     on_progress.assert_any_call(control.table, "3 rows")
+
+
+# Foreign keys
+
+
+def test_resource_index_preserves_declared_foreign_keys(sqlite_url, tmp_path):
+    # Indexing suppresses the foreign key handling but must not drop
+    # the relations declared in the resource schema
+    target = tmp_path / "target.csv"
+    target.write_text("id,name\n1,english\n2,french\n")
+    resource = TableResource(
+        path=str(target),
+        schema=Schema.from_descriptor(
+            {
+                "fields": [
+                    {"name": "id", "type": "integer"},
+                    {"name": "name", "type": "string"},
+                ],
+                "foreignKeys": [
+                    {"fields": ["id"], "reference": {"resource": "", "fields": ["id"]}}
+                ],
+            }
+        ),
+    )
+    declared = list(resource.schema.foreign_keys)
+    resource.index(sqlite_url, name="indexed_table")
+    assert resource.schema.foreign_keys == declared
+    control = formats.sql.SqlControl(table="indexed_table")
+    assert TableResource(path=sqlite_url, control=control).read_rows() == [
+        {"id": 1, "name": "english"},
+        {"id": 2, "name": "french"},
+    ]

@@ -9,6 +9,7 @@ from frictionless import (
     Detector,
     FrictionlessException,
     Package,
+    Report,
     Resource,
     Schema,
     fields,
@@ -617,6 +618,166 @@ def test_package_validate_schema_multiple_foreign_key_violations():
         [5, ["id"], ["6"], "people", ["label"]],
         [4, ["from", "to"], ["3", "4"], "cities", ["id", "next_id"]],
     ]
+
+
+# Foreign key lifecycle
+
+
+def _write_three_table_csvs(tmp_path, c_rows=[[3, ""]]):
+    import csv
+
+    def write(name, rows):
+        with open(tmp_path / name, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["id", "ref"])
+            writer.writerows(rows)
+
+    write("a.csv", [[1, 2]])
+    write("b.csv", [[2, 999]])
+    write("c.csv", c_rows)
+
+
+def _three_table_descriptor(order):
+    def table(name, reference=None):
+        schema = {
+            "fields": [
+                {"name": "id", "type": "integer"},
+                {"name": "ref", "type": "integer"},
+            ]
+        }
+        if reference:
+            schema["foreignKeys"] = [
+                {"fields": ["ref"], "reference": {"resource": reference, "fields": ["id"]}}
+            ]
+        return {"name": name, "path": f"{name}.csv", "schema": schema}
+
+    tables = {"a": table("a", "b"), "b": table("b", "c"), "c": table("c")}
+    return {"resources": [tables[name] for name in order]}
+
+
+def _assert_three_table_report(report):
+    # a matches b.id=2, b.ref=999 dangles on c, c has no foreign keys
+    assert not report.valid
+    tasks = {task.name: task for task in report.tasks}
+    assert tasks["a"].errors == []
+    assert tasks["c"].errors == []
+    assert len(tasks["b"].errors) == 1
+    error = tasks["b"].errors[0]
+    assert error.type == "foreign-key"
+    assert error.row_number == 2
+    assert error.field_names == ["ref"]
+    assert error.field_cells == ["999"]
+    assert error.reference_name == "c"
+    assert error.reference_field_names == ["id"]
+
+
+@pytest.mark.parametrize("order", [["a", "b", "c"], ["b", "a", "c"], ["c", "b", "a"]])
+def test_package_validate_foreign_key_order_independent(tmp_path, order):
+    _write_three_table_csvs(tmp_path)
+    package = Package(_three_table_descriptor(order), basepath=str(tmp_path))
+    _assert_three_table_report(package.validate())
+
+
+def test_package_validate_foreign_key_repeatable(tmp_path):
+    _write_three_table_csvs(tmp_path)
+    package = Package(_three_table_descriptor(["a", "b", "c"]), basepath=str(tmp_path))
+    _assert_three_table_report(package.validate())
+    _assert_three_table_report(package.validate())
+    # The declared relations survive the validations
+    assert package.get_resource("a").schema.foreign_keys
+    assert package.get_resource("b").schema.foreign_keys
+
+
+def test_package_validate_foreign_key_fresh_after_target_update(tmp_path):
+    _write_three_table_csvs(tmp_path)
+    package = Package(_three_table_descriptor(["a", "b", "c"]), basepath=str(tmp_path))
+    _assert_three_table_report(package.validate())
+
+    # The next validation sees the updated target instead of stale keys
+    _write_three_table_csvs(tmp_path, c_rows=[[3, ""], [999, ""]])
+    report = package.validate()
+    assert report.valid
+
+    _write_three_table_csvs(tmp_path)
+    _assert_three_table_report(package.validate())
+
+
+def test_package_validate_foreign_key_report_descriptor_round_trip(tmp_path):
+    _write_three_table_csvs(tmp_path)
+    package = Package(_three_table_descriptor(["a", "b", "c"]), basepath=str(tmp_path))
+    report = package.validate()
+    restored = Report.from_descriptor(report.to_descriptor())
+    keys = ["rowNumber", "fieldNames", "fieldCells", "referenceName", "referenceFieldNames"]
+    assert restored.flatten(keys) == report.flatten(keys) == [
+        [2, ["ref"], ["999"], "c", ["id"]]
+    ]
+
+
+def test_package_validate_foreign_key_limit_errors_reads_whole_target(tmp_path):
+    import csv
+
+    # The only valid key sits at the very end of the target
+    with open(tmp_path / "t.csv", "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["id"])
+        writer.writerows([[i] for i in range(1, 1000)])
+    with open(tmp_path / "r.csv", "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["k"])
+        writer.writerow([999])  # valid, found only if the target is read fully
+        writer.writerows([[10000 + i] for i in range(10)])  # dangling
+    package = Package(
+        {
+            "resources": [
+                {
+                    "name": "t",
+                    "path": "t.csv",
+                    "schema": {"fields": [{"name": "id", "type": "integer"}]},
+                },
+                {
+                    "name": "r",
+                    "path": "r.csv",
+                    "schema": {
+                        "fields": [{"name": "k", "type": "integer"}],
+                        "foreignKeys": [
+                            {"fields": ["k"], "reference": {"resource": "t", "fields": ["id"]}}
+                        ],
+                    },
+                },
+            ]
+        },
+        basepath=str(tmp_path),
+    )
+    report = package.validate(limit_errors=3)
+    errors = report.tasks[1].errors
+    # The error limit truncates the saved errors, not the target scan:
+    # the first row (k=999) is not flagged and exactly 3 errors are saved
+    assert [error.row_number for error in errors] == [3, 4, 5]
+    assert all(error.type == "foreign-key" for error in errors)
+    assert report.tasks[1].warnings == ["reached error limit: 3"]
+
+
+def test_package_validate_foreign_key_name_selection_reads_dependencies(tmp_path):
+    _write_three_table_csvs(tmp_path)
+    package = Package(_three_table_descriptor(["a", "b", "c"]), basepath=str(tmp_path))
+    report = package.validate(name="a")
+    assert [task.name for task in report.tasks] == ["a"]
+    assert report.valid
+    report = package.validate(name="b")
+    assert [task.name for task in report.tasks] == ["b"]
+    assert not report.valid
+    assert len(report.tasks) == 1
+    error = report.tasks[0].errors[0]
+    assert error.type == "foreign-key"
+    assert error.row_number == 2
+    assert error.field_cells == ["999"]
+
+
+def test_package_validate_foreign_key_parallel_fallback(tmp_path):
+    _write_three_table_csvs(tmp_path)
+    package = Package(_three_table_descriptor(["a", "b", "c"]), basepath=str(tmp_path))
+    # Foreign keys keep the sequential execution even with parallel=True
+    _assert_three_table_report(package.validate(parallel=True))
 
 
 # Bugs

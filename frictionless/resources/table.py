@@ -14,6 +14,7 @@ from ..exception import FrictionlessException
 from ..indexer import Indexer
 from ..platform import platform
 from ..resource import Resource
+from ..resource.lookup import LookupScope
 from ..system import system
 from ..table import Header, Lookup, Row, Table
 from ..transformer import Transformer
@@ -40,6 +41,7 @@ class TableResource(Resource):
         self.__fragment: Optional[types.IFragment] = None
         self.__header: Optional[Header] = None
         self.__lookup: Optional[Lookup] = None
+        self.__lookup_scope: Optional[LookupScope] = None
         self.__row_stream: Optional[IRowStream] = None
         super().__attrs_post_init__()
 
@@ -153,6 +155,9 @@ class TableResource(Resource):
         if self.__loader:
             self.__loader.close()
             self.__loader = None
+        if self.__lookup_scope is not None:
+            self.__lookup_scope.release()
+            self.__lookup_scope = None
 
     def open(self):
         """Open the resource as "io.open" does"""
@@ -229,7 +234,24 @@ class TableResource(Resource):
 
     def __open_lookup(self):
         self.__lookup = Lookup()
-        for fk in self.schema.foreign_keys:
+        foreign_keys = self.schema.foreign_keys
+        if not foreign_keys:
+            return
+
+        # A validation run shares one lookup scope between the resources it
+        # validates (see Package.validate); a standalone opening gets a
+        # private scope that is released when the resource is closed
+        scope = LookupScope.current()
+        if scope is None:
+            if self.__lookup_scope is None:
+                self.__lookup_scope = LookupScope()
+            scope = self.__lookup_scope
+
+        # Resolve and register all the references before reading anything,
+        # so that a target shared by several keys or resources is scanned
+        # only once within the scope
+        references: List[Tuple[str, Tuple[str, ...], "TableResource"]] = []
+        for fk in foreign_keys:
             # Prepare source
             source_name = fk["reference"]["resource"]
             source_key = tuple(fk["reference"]["fields"])
@@ -244,23 +266,20 @@ class TableResource(Resource):
                     raise FrictionlessException(errors.ResourceError(note=note))
                 source_res = self.package.get_resource(source_name)
             else:
-                source_res = self.to_copy()
-            if source_res.schema:
-                source_res.schema.foreign_keys = []
+                source_res = self
+            references.append((source_name, source_key, source_res))  # type: ignore
+            scope.register(source_res, source_key)  # type: ignore
 
-            # Prepare lookup
+        # Prepare lookup
+        # The scope reads every distinct target at most once and through an
+        # isolated copy, so neither the target's schema nor its open streams
+        # are affected by the key collection
+        for source_name, source_key, source_res in references:
             self.__lookup.setdefault(source_name, {})
             if source_key in self.__lookup[source_name]:
                 continue
-            self.__lookup[source_name][source_key] = set()
-            if not source_res:
-                continue
-            with source_res:
-                for row in source_res.row_stream:  # type: ignore
-                    cells = tuple(row.get(field_name) for field_name in source_key)  # type: ignore
-                    if set(cells) == {None}:  # type: ignore
-                        continue
-                    self.__lookup[source_name][source_key].add(cells)
+            keys = scope.get_keys(source_res, source_key)
+            self.__lookup[source_name][source_key] = keys
 
     def __open_row_stream(self):
         # TODO: we need to rework this field_info / row code

@@ -8,6 +8,11 @@ Here described only the breaking and most significant changes. The full changelo
   (serialized as `trackSource`). When enabled, `Row.source` and validation
   errors carry line/column ranges of the originating record and cells. Only
   UTF-8 and UTF-8-SIG encodings are supported; other encodings are rejected.
+- fix: foreign key lookup collection no longer mutates the referenced
+  resource's schema nor closes/disturbs its open streams; key sets are
+  collected through isolated copies within a per-validation `LookupScope`
+  (shared between the resources of one `Package.validate` so a shared target
+  is scanned once), making validation order-independent and repeatable
 
 ## v5.18.1
 
